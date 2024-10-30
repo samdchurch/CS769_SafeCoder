@@ -63,15 +63,8 @@ def evaluate_example(model, tokenizer, example_path, device):
   input_text = file_context + func_context
   input_tokens = tokenizer.encode(input_text, return_tensors='pt').to(device)
   print(input_tokens.shape)
-  outputs = model.generate(input_tokens, do_sample=True,
-                num_return_sequences=20,
-                temperature=0.4,
-                max_new_tokens=256,
-                top_p=0.95,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-            )
+  outputs = model.generate(input_tokens, do_sample=True, num_return_sequences=1, temperature=0.4,
+    max_new_tokens=256, top_p=0.95, pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id, use_cache=True)
 
   outputs[:, :input_tokens.shape[1]] = input_tokens
 
