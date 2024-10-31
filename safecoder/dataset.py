@@ -85,6 +85,7 @@ class Upsampler:
 
 class CodeDataset(Dataset):
     def __init__(self, args, tokenizer, mode):
+        print("line 88 in codedataset ------------------------------------")
         self.args = args
         self.tokenizer = tokenizer
         self.mode = mode
@@ -103,17 +104,22 @@ class CodeDataset(Dataset):
         if self.mode == 'train' and len(safe_dataset) > 0:
             self.args.logger.info('number of sec samples before upsampling: %d', len(safe_dataset))
             safe_dataset, safe_dataset_json = self.upsampler.upsample(safe_dataset, safe_dataset_json, len(func_dataset))
-            self.args.logger.info('number of sec samples after upsampling: %d', len(safe_dataset))
+            self.args.logger.info('number of sec samples aftasdfasdfasdfasdfer upsampling: %d', len(safe_dataset))
         # inspect_cwe_dist(safe_dataset_json)
         # print(len(safe_dataset))
+        self.args.logger.info('checking line 110----------------')
 
         safe_dataset.extend(func_dataset)
         self.dataset = safe_dataset
         shuffle(self.dataset)
         # Save to file
+        self.args.logger.info('before saved dataset ------------------------------')
         with open(f'data_{mode}.pkl', 'wb') as f:
-            pickle.dump(data, f)
-    
+            pickle.dump(self.dataset, f)
+        print("saved dataset -----------------------------------------------------------------")
+        self.args.logger.info('***** saved dataset *****')
+
+
     def load_safe_datasets(self, dnames):
         dataset = []
         dataset_json = []
