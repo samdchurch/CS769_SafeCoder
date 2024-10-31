@@ -8,7 +8,7 @@ from random import shuffle
 
 from safecoder.constants import CWES_TRAINED, CWES_NEW_TRAINED, FUNC, GOOD, BAD, PROMPT_INPUT, PROMPT_NO_INPUT, SAFE_DESC_DATASETS
 from safecoder.utils import visualize_pair, visualize_weights, inspect_cwe_dist
-
+import pickle
 
 class Upsampler:
 
@@ -110,6 +110,9 @@ class CodeDataset(Dataset):
         safe_dataset.extend(func_dataset)
         self.dataset = safe_dataset
         shuffle(self.dataset)
+        # Save to file
+        with open(f'data_{mode}.pkl', 'wb') as f:
+            pickle.dump(data, f)
     
     def load_safe_datasets(self, dnames):
         dataset = []
