@@ -4,14 +4,15 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, LoraConfig, TaskType
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+import random
 
-from .utils import set_seed, load_model
 from .timer import Timer
 from .dataset import CodeDataset
 from .constants import FUNC, GOOD, BAD
+from .constants import PRETRAINED_MODELS, CHAT_MODELS
 
 class LossDict:
     def __init__(self, keys):
@@ -185,12 +186,105 @@ class Trainer:
             acc_loss_dict.step(loss_dict)
         return acc_loss_dict.pretty_print(self.args)
 
+    def set_seed_util(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    def load_model_util(self, model_name, args):
+        """
+        Important note:
+        This load function will only work for lora models if they are saved in the following pattern:
+            <pretrained_base_model_name>-lora<whatever_else>
+        """
+        if '-lora' in model_name:
+
+            pretrained_name = model_name.split('-lora')[0]
+            pretrained_model_dir = PRETRAINED_MODELS[pretrained_name]
+            if 'checkpoint-epoch' in model_name:
+                fine_tuned_model_dir = os.path.join(args.model_dir, model_name)
+            else:
+                fine_tuned_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+            assert os.path.exists(fine_tuned_model_dir)
+
+            tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_dir)
+            model = AutoModelForCausalLM.from_pretrained(pretrained_model_dir, device_map='auto', trust_remote_code=True)
+            model.resize_token_embeddings(len(tokenizer))
+            model = PeftModel.from_pretrained(model, fine_tuned_model_dir)
+            model = model.merge_and_unload()
+
+        elif '-sven' in model_name: # happens during testing
+
+            pretrained_name = model_name.split('-sven')[0]
+            pretrained_model_dir = os.path.join(args.model_dir, pretrained_name, 'checkpoint-last')
+
+            if 'starcoderbase' in pretrained_name:
+                model_class = GPTBigCodeForPrefix
+            elif 'phi-2' in pretrained_name:
+                model_class = PhiPrefix
+            else:
+                raise NotImplementedError()
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
+            model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
+
+            if 'checkpoint-epoch' in model_name:
+                model_dir = os.path.join(args.model_dir, model_name)
+            else:
+                model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+            assert os.path.exists(model_dir)
+            prefix_file = os.path.join(model_dir, 'pytorch_model.bin')
+            model.prefix_params.load_state_dict(torch.load(prefix_file))
+
+        elif hasattr(args, 'sven') and args.sven: # happens during training
+
+            pretrained_name = model_name
+            pretrained_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+
+            if 'starcoderbase' in pretrained_name:
+                model_class = GPTBigCodeForPrefix
+            elif 'phi-2' in pretrained_name:
+                model_class = PhiPrefix
+            else:
+                raise NotImplementedError()
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
+            model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
+
+            for n, p in model.named_parameters():
+                if n.startswith('prefix_params'):
+                    p.requires_grad = True
+                else:
+                    p.requires_grad = False
+            with torch.no_grad():
+                for param in model.prefix_params:
+                    param.fill_(0.0)
+
+        else:
+
+            if model_name in PRETRAINED_MODELS:
+                model_dir = PRETRAINED_MODELS[model_name]
+            elif model_name in CHAT_MODELS:
+                model_dir = CHAT_MODELS[model_name]
+            else:
+                if 'checkpoint-epoch' in model_name:
+                    model_dir = os.path.join(args.model_dir, model_name)
+                else:
+                    model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+                assert os.path.exists(model_dir)
+
+            tokenizer = AutoTokenizer.from_pretrained(model_dir)
+            if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
+                model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
+            else:    
+                model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
+            model.resize_token_embeddings(len(tokenizer))
+        return tokenizer, model
+
     def load_model(self):
-        self.tokenizer, self.model = load_model(self.args.pretrain_name, self.args)
+        self.tokenizer, self.model = self.load_model_util(self.args.pretrain_name, self.args)
         self.model.train()
 
         if self.args.kl_loss_weight > 0 and not self.args.sven:
-            _, self.ref_model = load_model(self.args.pretrain_name, self.args)
+            _, self.ref_model = self.load_model_util(self.args.pretrain_name, self.args)
             self.ref_model.eval()
 
     def load_dataset(self):
@@ -212,25 +306,25 @@ class Trainer:
             self.model.save_pretrained(path)
             self.tokenizer.save_pretrained(path)
 
-    def create_lora_config(self):
-        """
-        Includes all linear layers in the LoRA training.
-        """
-        self.lora_config = LoraConfig(
-            r=self.args.r,
-            target_modules=list(set([name for name in re.findall(r'\((\w+)\): Linear', str(self.model.modules))])),
-            lora_alpha=self.args.lora_alpha,
-            lora_dropout=self.args.lora_dropout,
-            task_type="CAUSAL_LM"
-        )
-
+    # def create_lora_config(self):
+    #     """
+    #     Includes all linear layers in the LoRA training.
+    #     """
+    #     self.lora_config = LoraConfig(
+    #         r=self.args.r,
+    #         target_modules=list(set([name for name in re.findall(r'\((\w+)\): Linear', str(self.model.modules))])),
+    #         lora_alpha=self.args.lora_alpha,
+    #         lora_dropout=self.args.lora_dropout,
+    #         task_type="CAUSAL_LM"
+    #     )
+    
     def run(self):
         self.load_model()
         self.load_dataset()
 
-        if self.args.lora:
-            self.create_lora_config()
-            self.model = get_peft_model(self.model, self.lora_config)
+        # if self.args.lora:
+        #     self.create_lora_config()
+        #     self.model = get_peft_model(self.model, self.lora_config)
 
         self.args.logger.info(f'Training args {self.args}')
 
@@ -266,7 +360,7 @@ class Trainer:
         self.args.logger.info('  Num trainable parameters = %d', num_trainable_params)
 
         global_step, acc_loss_dict = 0, LossDict(self.loss_keys)
-        set_seed(self.args.seed)
+        self.set_seed_util(self.args.seed)
         timer = Timer(total_steps)
         timer.start()
         self.model.train()
