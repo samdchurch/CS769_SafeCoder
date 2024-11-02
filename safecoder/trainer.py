@@ -6,13 +6,129 @@ import numpy as np
 from collections import OrderedDict
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, LoraConfig, TaskType
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
 import random
 
-from .timer import Timer
-from .dataset import CodeDataset
+# from .dataset import CodeDataset
 from .constants import FUNC, GOOD, BAD
 from .constants import PRETRAINED_MODELS, CHAT_MODELS
+
+from time import time
+import pickle
+
+
+class Timer:
+    """
+    An object that keeps track of our progress in some repetitive loop and outputs a time estimate of the remaining time
+    we will need to finish our loop. It is a handy tool for line and or grid searches, or sequential monte carlo
+    simulations. Note that if the constituting steps in the loop(s) take vastly different times, the time estimate can
+    be arbitrarily off, however the overall progress will still be displayed.
+    """
+
+    def __init__(self, total_steps):
+        """
+        Constructor.
+
+        :param total_steps: (int) The total number of steps the measured process will make.
+        """
+        self.total_steps = total_steps
+        self.total_time_elapsed = 0.
+        self.recorded_steps = 0
+        self.running_avg = None
+        self.last_measured_time = None
+
+        # time estimates
+        self.remaining_seconds = None
+        self.remaining_minutes = None
+        self.remaining_hours = None
+
+        # completion
+        self.completion = 0.
+
+    def __str__(self):
+        self._calculate_completion_and_time_remaining()
+        spaces = '          '  # to account for overhanging lines :)
+        return f'{int(self.completion * 100)}%: {self.remaining_hours}h {self.remaining_minutes}m {self.remaining_seconds}s{spaces}'
+
+    def start(self):
+        """
+        Mark the start of the innermost loop over which you wish to measure and record the current clock time.
+
+        :return: None
+        """
+        self.last_measured_time = time()
+
+    def end(self):
+        """
+        Mark the end of the innermost loop over which you wish to measure and record the current clock time. Eventually,
+        update the running average estimate and add a step to the completed ones.
+
+        :return: None
+        """
+        recorded_time = time() - self.last_measured_time
+        self.total_time_elapsed += recorded_time
+        if self.running_avg is None:
+            self.running_avg = recorded_time
+        else:
+            self.running_avg = (self.running_avg * self.recorded_steps + recorded_time) / (self.recorded_steps + 1)
+        self.recorded_steps += 1
+
+    @staticmethod
+    def _convert_seconds_to_h_m_s(seconds):
+        """
+        A private method to convert seconds into hours, minutes and seconds for better human readability.
+
+        :param seconds: (int) Seconds we wish to convert into h, m, s format.
+        :return: (tuple) The amount of seconds given converted into h, m, s format.
+        """
+        hours = int(seconds // 3600)
+        minutes = int((seconds - hours * 3600) // 60)
+        rem_seconds = int(seconds - hours * 3600 - minutes * 60)
+        return hours, minutes, rem_seconds
+
+    def _calculate_completion_and_time_remaining(self):
+        """
+        Private method to compute the completion of the process and estimate the remaining time from the running
+        average.
+
+        :return: None
+        """
+        remaining = self.total_steps - self.recorded_steps
+        self.completion = self.recorded_steps / self.total_steps
+        if self.running_avg is not None:
+            estimated_time = remaining * self.running_avg
+            self.remaining_hours, self.remaining_minutes, self.remaining_seconds = self._convert_seconds_to_h_m_s(estimated_time)
+        else:
+            self.remaining_hours = '??'
+            self.remaining_minutes = '??'
+            self.remaining_seconds = '??'
+
+    def duration(self):
+        """
+        After the process has finished call this method to display the absolute time the completion of the whole process
+        has taken.
+
+        :return: None
+        """
+        h, m, s = self._convert_seconds_to_h_m_s(self.total_time_elapsed)
+        print('\n')
+        print(f'Completed. Time Elapsed: {h}h {m}m {s}s')
+
+
+class CodeDataset(Dataset):
+    def __init__(self, args, tokenizer, mode):
+        self.args = args
+        with open(f'data_{mode}.pkl', 'rb') as f:
+            loaded_data = pickle.load(f)
+        self.dataset = loaded_data
+        self.args.logger.info('***** saved dataset *****')
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, item):
+        return tuple(torch.tensor(t) for t in self.dataset[item])
+
 
 class LossDict:
     def __init__(self, keys):
@@ -88,9 +204,6 @@ class Trainer:
         self.model = None
         self.tokenizer = None
         self.dataset = None
-        # if self.args.sven:
-        #     self.loss_keys = ['lm', 'contra', 'kl']
-        # else:
         self.loss_keys = ['func', 'pos', 'neg']
         if self.args.kl_loss_weight > 0:
             self.loss_keys.append('kl')
@@ -134,49 +247,6 @@ class Trainer:
 
         return loss_total, loss_dict
 
-    # def sven_step(self, batch):
-    #     loss_dict = LossDict(self.loss_keys)
-
-    #     control_ids, inputs, weights = batch
-    #     inputs = inputs.to(self.model.device)
-    #     shift_inputs = inputs[..., 1:].squeeze(0)
-    #     weights = weights.to(self.model.device)
-    #     shift_weights = weights[..., 1:].squeeze(0)
-    #     control_ids = control_ids.to(self.model.device)
-    #     control_ids -= 1
-
-    #     correct_logits, correct_label_probs = get_logits_from_lm(self.model, inputs, control_ids)
-    #     lm_loss = token_weighted_loss('ce', correct_logits, shift_inputs, shift_weights)
-    #     loss_dict['lm'].append(lm_loss.item())
-
-    #     incorrect_control_ids = -1 * (control_ids - 1)
-    #     incorrect_logits, incorrect_label_probs = get_logits_from_lm(self.model, inputs, incorrect_control_ids)
-
-    #     contrastive_probs = torch.stack((correct_label_probs, incorrect_label_probs), dim=1)
-    #     contrastive_probs = F.normalize(contrastive_probs, p=1, dim=-1)
-    #     contrastive_log_probs = torch.log(contrastive_probs)
-    #     contrastive_labels = torch.zeros(shift_inputs.shape, dtype=torch.int64).to(self.model.device)
-    #     contrastive_loss = token_weighted_loss('nll', contrastive_log_probs, contrastive_labels, shift_weights)
-    #     contrastive_loss *= 4
-    #     loss_dict['contra'].append(contrastive_loss.item())
-
-    #     assert self.args.kl_loss_weight > 0
-    #     correct_log_probs = F.log_softmax(correct_logits, dim=-1)
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         ref_logits, _ = get_logits_from_lm(self.model, inputs, None)
-    #     self.model.train()
-    #     ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-    #     kl_loss = token_weighted_loss('kl', correct_log_probs, ref_log_probs, 1-shift_weights)
-    #     incorrect_log_probs = F.log_softmax(incorrect_logits, dim=-1)
-    #     kl_loss += token_weighted_loss('kl', incorrect_log_probs, ref_log_probs, 1-shift_weights)
-    #     kl_loss = kl_loss * self.args.kl_loss_weight / 1000
-    #     loss_dict['kl'].append(kl_loss.item())
-
-    #     loss_total = lm_loss + contrastive_loss + kl_loss
-
-    #     return loss_total, loss_dict
-
     def do_eval(self):
         val_sampler = SequentialSampler(self.val_dataset)
         val_dataloader = DataLoader(self.val_dataset, sampler=val_sampler, batch_size=1)
@@ -198,68 +268,6 @@ class Trainer:
         This load function will only work for lora models if they are saved in the following pattern:
             <pretrained_base_model_name>-lora<whatever_else>
         """
-        # if '-lora' in model_name:
-
-        #     pretrained_name = model_name.split('-lora')[0]
-        #     pretrained_model_dir = PRETRAINED_MODELS[pretrained_name]
-        #     if 'checkpoint-epoch' in model_name:
-        #         fine_tuned_model_dir = os.path.join(args.model_dir, model_name)
-        #     else:
-        #         fine_tuned_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-        #     assert os.path.exists(fine_tuned_model_dir)
-
-        #     tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_dir)
-        #     model = AutoModelForCausalLM.from_pretrained(pretrained_model_dir, device_map='auto', trust_remote_code=True)
-        #     model.resize_token_embeddings(len(tokenizer))
-        #     model = PeftModel.from_pretrained(model, fine_tuned_model_dir)
-        #     model = model.merge_and_unload()
-
-        # elif '-sven' in model_name: # happens during testing
-
-        #     pretrained_name = model_name.split('-sven')[0]
-        #     pretrained_model_dir = os.path.join(args.model_dir, pretrained_name, 'checkpoint-last')
-
-        #     if 'starcoderbase' in pretrained_name:
-        #         model_class = GPTBigCodeForPrefix
-        #     elif 'phi-2' in pretrained_name:
-        #         model_class = PhiPrefix
-        #     else:
-        #         raise NotImplementedError()
-        #     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
-        #     model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
-
-        #     if 'checkpoint-epoch' in model_name:
-        #         model_dir = os.path.join(args.model_dir, model_name)
-        #     else:
-        #         model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-        #     assert os.path.exists(model_dir)
-        #     prefix_file = os.path.join(model_dir, 'pytorch_model.bin')
-        #     model.prefix_params.load_state_dict(torch.load(prefix_file))
-
-        # elif hasattr(args, 'sven') and args.sven: # happens during training
-
-        #     pretrained_name = model_name
-        #     pretrained_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-
-        #     if 'starcoderbase' in pretrained_name:
-        #         model_class = GPTBigCodeForPrefix
-        #     elif 'phi-2' in pretrained_name:
-        #         model_class = PhiPrefix
-        #     else:
-        #         raise NotImplementedError()
-        #     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
-        #     model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
-
-        #     for n, p in model.named_parameters():
-        #         if n.startswith('prefix_params'):
-        #             p.requires_grad = True
-        #         else:
-        #             p.requires_grad = False
-        #     with torch.no_grad():
-        #         for param in model.prefix_params:
-        #             param.fill_(0.0)
-
-        # else:
 
         if model_name in PRETRAINED_MODELS:
             model_dir = PRETRAINED_MODELS[model_name]
@@ -296,36 +304,12 @@ class Trainer:
         """
         For normal models this saves the whole set of weights, for LoRA models it saves the adapter.
         """
-        # if self.args.sven:
-        #     os.makedirs(path, exist_ok=True)
-        #     prefix_file = os.path.join(path, 'pytorch_model.bin')
-        #     state_dict = self.model.prefix_params.state_dict()
-        #     for k, v in state_dict.items():
-        #         state_dict[k] = v.cpu()
-        #     torch.save(state_dict, prefix_file)
-        # else:
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
-
-    # def create_lora_config(self):
-    #     """
-    #     Includes all linear layers in the LoRA training.
-    #     """
-    #     self.lora_config = LoraConfig(
-    #         r=self.args.r,
-    #         target_modules=list(set([name for name in re.findall(r'\((\w+)\): Linear', str(self.model.modules))])),
-    #         lora_alpha=self.args.lora_alpha,
-    #         lora_dropout=self.args.lora_dropout,
-    #         task_type="CAUSAL_LM"
-    #     )
     
     def run(self):
         self.load_model()
         self.load_dataset()
-
-        # if self.args.lora:
-        #     self.create_lora_config()
-        #     self.model = get_peft_model(self.model, self.lora_config)
 
         self.args.logger.info(f'Training args {self.args}')
 
@@ -367,7 +351,6 @@ class Trainer:
         self.model.train()
         for idx in range(self.args.num_train_epochs):
             for step, batch in enumerate(train_dataloader):
-                # loss, loss_dict = self.sven_step(batch) if self.args.sven else self.step(batch)
                 loss, loss_dict = self.step(batch)
 
                 loss /= self.args.grad_acc_steps
