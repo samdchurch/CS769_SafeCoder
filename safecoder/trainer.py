@@ -88,12 +88,12 @@ class Trainer:
         self.model = None
         self.tokenizer = None
         self.dataset = None
-        if self.args.sven:
-            self.loss_keys = ['lm', 'contra', 'kl']
-        else:
-            self.loss_keys = ['func', 'pos', 'neg']
-            if self.args.kl_loss_weight > 0:
-                self.loss_keys.append('kl')
+        # if self.args.sven:
+        #     self.loss_keys = ['lm', 'contra', 'kl']
+        # else:
+        self.loss_keys = ['func', 'pos', 'neg']
+        if self.args.kl_loss_weight > 0:
+            self.loss_keys.append('kl')
 
     def step(self, batch):
         loss_dict = LossDict(self.loss_keys)
@@ -134,55 +134,56 @@ class Trainer:
 
         return loss_total, loss_dict
 
-    def sven_step(self, batch):
-        loss_dict = LossDict(self.loss_keys)
+    # def sven_step(self, batch):
+    #     loss_dict = LossDict(self.loss_keys)
 
-        control_ids, inputs, weights = batch
-        inputs = inputs.to(self.model.device)
-        shift_inputs = inputs[..., 1:].squeeze(0)
-        weights = weights.to(self.model.device)
-        shift_weights = weights[..., 1:].squeeze(0)
-        control_ids = control_ids.to(self.model.device)
-        control_ids -= 1
+    #     control_ids, inputs, weights = batch
+    #     inputs = inputs.to(self.model.device)
+    #     shift_inputs = inputs[..., 1:].squeeze(0)
+    #     weights = weights.to(self.model.device)
+    #     shift_weights = weights[..., 1:].squeeze(0)
+    #     control_ids = control_ids.to(self.model.device)
+    #     control_ids -= 1
 
-        correct_logits, correct_label_probs = get_logits_from_lm(self.model, inputs, control_ids)
-        lm_loss = token_weighted_loss('ce', correct_logits, shift_inputs, shift_weights)
-        loss_dict['lm'].append(lm_loss.item())
+    #     correct_logits, correct_label_probs = get_logits_from_lm(self.model, inputs, control_ids)
+    #     lm_loss = token_weighted_loss('ce', correct_logits, shift_inputs, shift_weights)
+    #     loss_dict['lm'].append(lm_loss.item())
 
-        incorrect_control_ids = -1 * (control_ids - 1)
-        incorrect_logits, incorrect_label_probs = get_logits_from_lm(self.model, inputs, incorrect_control_ids)
+    #     incorrect_control_ids = -1 * (control_ids - 1)
+    #     incorrect_logits, incorrect_label_probs = get_logits_from_lm(self.model, inputs, incorrect_control_ids)
 
-        contrastive_probs = torch.stack((correct_label_probs, incorrect_label_probs), dim=1)
-        contrastive_probs = F.normalize(contrastive_probs, p=1, dim=-1)
-        contrastive_log_probs = torch.log(contrastive_probs)
-        contrastive_labels = torch.zeros(shift_inputs.shape, dtype=torch.int64).to(self.model.device)
-        contrastive_loss = token_weighted_loss('nll', contrastive_log_probs, contrastive_labels, shift_weights)
-        contrastive_loss *= 4
-        loss_dict['contra'].append(contrastive_loss.item())
+    #     contrastive_probs = torch.stack((correct_label_probs, incorrect_label_probs), dim=1)
+    #     contrastive_probs = F.normalize(contrastive_probs, p=1, dim=-1)
+    #     contrastive_log_probs = torch.log(contrastive_probs)
+    #     contrastive_labels = torch.zeros(shift_inputs.shape, dtype=torch.int64).to(self.model.device)
+    #     contrastive_loss = token_weighted_loss('nll', contrastive_log_probs, contrastive_labels, shift_weights)
+    #     contrastive_loss *= 4
+    #     loss_dict['contra'].append(contrastive_loss.item())
 
-        assert self.args.kl_loss_weight > 0
-        correct_log_probs = F.log_softmax(correct_logits, dim=-1)
-        self.model.eval()
-        with torch.no_grad():
-            ref_logits, _ = get_logits_from_lm(self.model, inputs, None)
-        self.model.train()
-        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-        kl_loss = token_weighted_loss('kl', correct_log_probs, ref_log_probs, 1-shift_weights)
-        incorrect_log_probs = F.log_softmax(incorrect_logits, dim=-1)
-        kl_loss += token_weighted_loss('kl', incorrect_log_probs, ref_log_probs, 1-shift_weights)
-        kl_loss = kl_loss * self.args.kl_loss_weight / 1000
-        loss_dict['kl'].append(kl_loss.item())
+    #     assert self.args.kl_loss_weight > 0
+    #     correct_log_probs = F.log_softmax(correct_logits, dim=-1)
+    #     self.model.eval()
+    #     with torch.no_grad():
+    #         ref_logits, _ = get_logits_from_lm(self.model, inputs, None)
+    #     self.model.train()
+    #     ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+    #     kl_loss = token_weighted_loss('kl', correct_log_probs, ref_log_probs, 1-shift_weights)
+    #     incorrect_log_probs = F.log_softmax(incorrect_logits, dim=-1)
+    #     kl_loss += token_weighted_loss('kl', incorrect_log_probs, ref_log_probs, 1-shift_weights)
+    #     kl_loss = kl_loss * self.args.kl_loss_weight / 1000
+    #     loss_dict['kl'].append(kl_loss.item())
 
-        loss_total = lm_loss + contrastive_loss + kl_loss
+    #     loss_total = lm_loss + contrastive_loss + kl_loss
 
-        return loss_total, loss_dict
+    #     return loss_total, loss_dict
 
     def do_eval(self):
         val_sampler = SequentialSampler(self.val_dataset)
         val_dataloader = DataLoader(self.val_dataset, sampler=val_sampler, batch_size=1)
         acc_loss_dict = LossDict(self.loss_keys)
         for batch in val_dataloader:
-            loss, loss_dict = self.sven_step(batch) if self.args.sven else self.step(batch)
+            # loss, loss_dict = self.sven_step(batch) if self.args.sven else 
+            loss, loss_dict = self.step(batch)
             acc_loss_dict.step(loss_dict)
         return acc_loss_dict.pretty_print(self.args)
 
@@ -197,86 +198,86 @@ class Trainer:
         This load function will only work for lora models if they are saved in the following pattern:
             <pretrained_base_model_name>-lora<whatever_else>
         """
-        if '-lora' in model_name:
+        # if '-lora' in model_name:
 
-            pretrained_name = model_name.split('-lora')[0]
-            pretrained_model_dir = PRETRAINED_MODELS[pretrained_name]
-            if 'checkpoint-epoch' in model_name:
-                fine_tuned_model_dir = os.path.join(args.model_dir, model_name)
-            else:
-                fine_tuned_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-            assert os.path.exists(fine_tuned_model_dir)
+        #     pretrained_name = model_name.split('-lora')[0]
+        #     pretrained_model_dir = PRETRAINED_MODELS[pretrained_name]
+        #     if 'checkpoint-epoch' in model_name:
+        #         fine_tuned_model_dir = os.path.join(args.model_dir, model_name)
+        #     else:
+        #         fine_tuned_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+        #     assert os.path.exists(fine_tuned_model_dir)
 
-            tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_dir)
-            model = AutoModelForCausalLM.from_pretrained(pretrained_model_dir, device_map='auto', trust_remote_code=True)
-            model.resize_token_embeddings(len(tokenizer))
-            model = PeftModel.from_pretrained(model, fine_tuned_model_dir)
-            model = model.merge_and_unload()
+        #     tokenizer = AutoTokenizer.from_pretrained(fine_tuned_model_dir)
+        #     model = AutoModelForCausalLM.from_pretrained(pretrained_model_dir, device_map='auto', trust_remote_code=True)
+        #     model.resize_token_embeddings(len(tokenizer))
+        #     model = PeftModel.from_pretrained(model, fine_tuned_model_dir)
+        #     model = model.merge_and_unload()
 
-        elif '-sven' in model_name: # happens during testing
+        # elif '-sven' in model_name: # happens during testing
 
-            pretrained_name = model_name.split('-sven')[0]
-            pretrained_model_dir = os.path.join(args.model_dir, pretrained_name, 'checkpoint-last')
+        #     pretrained_name = model_name.split('-sven')[0]
+        #     pretrained_model_dir = os.path.join(args.model_dir, pretrained_name, 'checkpoint-last')
 
-            if 'starcoderbase' in pretrained_name:
-                model_class = GPTBigCodeForPrefix
-            elif 'phi-2' in pretrained_name:
-                model_class = PhiPrefix
-            else:
-                raise NotImplementedError()
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
-            model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
+        #     if 'starcoderbase' in pretrained_name:
+        #         model_class = GPTBigCodeForPrefix
+        #     elif 'phi-2' in pretrained_name:
+        #         model_class = PhiPrefix
+        #     else:
+        #         raise NotImplementedError()
+        #     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
+        #     model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
 
+        #     if 'checkpoint-epoch' in model_name:
+        #         model_dir = os.path.join(args.model_dir, model_name)
+        #     else:
+        #         model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+        #     assert os.path.exists(model_dir)
+        #     prefix_file = os.path.join(model_dir, 'pytorch_model.bin')
+        #     model.prefix_params.load_state_dict(torch.load(prefix_file))
+
+        # elif hasattr(args, 'sven') and args.sven: # happens during training
+
+        #     pretrained_name = model_name
+        #     pretrained_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+
+        #     if 'starcoderbase' in pretrained_name:
+        #         model_class = GPTBigCodeForPrefix
+        #     elif 'phi-2' in pretrained_name:
+        #         model_class = PhiPrefix
+        #     else:
+        #         raise NotImplementedError()
+        #     tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
+        #     model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
+
+        #     for n, p in model.named_parameters():
+        #         if n.startswith('prefix_params'):
+        #             p.requires_grad = True
+        #         else:
+        #             p.requires_grad = False
+        #     with torch.no_grad():
+        #         for param in model.prefix_params:
+        #             param.fill_(0.0)
+
+        # else:
+
+        if model_name in PRETRAINED_MODELS:
+            model_dir = PRETRAINED_MODELS[model_name]
+        elif model_name in CHAT_MODELS:
+            model_dir = CHAT_MODELS[model_name]
+        else:
             if 'checkpoint-epoch' in model_name:
                 model_dir = os.path.join(args.model_dir, model_name)
             else:
                 model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
             assert os.path.exists(model_dir)
-            prefix_file = os.path.join(model_dir, 'pytorch_model.bin')
-            model.prefix_params.load_state_dict(torch.load(prefix_file))
 
-        elif hasattr(args, 'sven') and args.sven: # happens during training
-
-            pretrained_name = model_name
-            pretrained_model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-
-            if 'starcoderbase' in pretrained_name:
-                model_class = GPTBigCodeForPrefix
-            elif 'phi-2' in pretrained_name:
-                model_class = PhiPrefix
-            else:
-                raise NotImplementedError()
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir)
-            model = model_class.from_pretrained(pretrained_model_dir, device_map='auto', vocab_size=len(tokenizer))
-
-            for n, p in model.named_parameters():
-                if n.startswith('prefix_params'):
-                    p.requires_grad = True
-                else:
-                    p.requires_grad = False
-            with torch.no_grad():
-                for param in model.prefix_params:
-                    param.fill_(0.0)
-
-        else:
-
-            if model_name in PRETRAINED_MODELS:
-                model_dir = PRETRAINED_MODELS[model_name]
-            elif model_name in CHAT_MODELS:
-                model_dir = CHAT_MODELS[model_name]
-            else:
-                if 'checkpoint-epoch' in model_name:
-                    model_dir = os.path.join(args.model_dir, model_name)
-                else:
-                    model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-                assert os.path.exists(model_dir)
-
-            tokenizer = AutoTokenizer.from_pretrained(model_dir)
-            if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
-                model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
-            else:    
-                model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
-            model.resize_token_embeddings(len(tokenizer))
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
+            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
+        else:    
+            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
+        model.resize_token_embeddings(len(tokenizer))
         return tokenizer, model
 
     def load_model(self):
@@ -295,16 +296,16 @@ class Trainer:
         """
         For normal models this saves the whole set of weights, for LoRA models it saves the adapter.
         """
-        if self.args.sven:
-            os.makedirs(path, exist_ok=True)
-            prefix_file = os.path.join(path, 'pytorch_model.bin')
-            state_dict = self.model.prefix_params.state_dict()
-            for k, v in state_dict.items():
-                state_dict[k] = v.cpu()
-            torch.save(state_dict, prefix_file)
-        else:
-            self.model.save_pretrained(path)
-            self.tokenizer.save_pretrained(path)
+        # if self.args.sven:
+        #     os.makedirs(path, exist_ok=True)
+        #     prefix_file = os.path.join(path, 'pytorch_model.bin')
+        #     state_dict = self.model.prefix_params.state_dict()
+        #     for k, v in state_dict.items():
+        #         state_dict[k] = v.cpu()
+        #     torch.save(state_dict, prefix_file)
+        # else:
+        self.model.save_pretrained(path)
+        self.tokenizer.save_pretrained(path)
 
     # def create_lora_config(self):
     #     """
@@ -366,7 +367,9 @@ class Trainer:
         self.model.train()
         for idx in range(self.args.num_train_epochs):
             for step, batch in enumerate(train_dataloader):
-                loss, loss_dict = self.sven_step(batch) if self.args.sven else self.step(batch)
+                # loss, loss_dict = self.sven_step(batch) if self.args.sven else self.step(batch)
+                loss, loss_dict = self.step(batch)
+
                 loss /= self.args.grad_acc_steps
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
