@@ -106,46 +106,30 @@ class LossDict:
         return self.loss_data[key]
 
 def token_weighted_loss(loss_type, inputs, targets, weights):
-    if loss_type == 'ce':
-        inputs = inputs.view(-1, inputs.size(-1))
-        targets = targets.view(-1)
-        weights = weights.view(-1)
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(inputs, targets)
-    elif loss_type == 'nll':
-        inputs = inputs.view(-1, inputs.size(-1))
-        targets = targets.view(-1)
-        weights = weights.view(-1)
-        loss_fct = torch.nn.NLLLoss(reduction='none')
-        loss = loss_fct(inputs, targets)
-    elif loss_type == 'ul':
+    inputs, targets, weights = inputs.view(-1, inputs.size(-1)), targets.view(-1), weights.view(-1)
+    
+    loss_fns = {
+        'ce': torch.nn.CrossEntropyLoss(reduction='none'),
+        'nll': torch.nn.NLLLoss(reduction='none'),
+        'kl': torch.nn.KLDivLoss(log_target=True, reduction='none')
+    }
+    
+    if loss_type == 'ul':
+        # Ensure that inputs are in the right shape before softmax and gather
         probs = F.softmax(inputs, dim=-1)
-        probs = torch.gather(probs, 2, targets.unsqueeze(-1)).squeeze(-1)
-        probs = torch.clamp((1.0-probs), min=1e-5)
-        loss = -torch.log(probs)
-    elif loss_type == 'kl':
-        inputs = inputs.view(-1, inputs.size(-1))
-        targets = targets.view(-1, targets.size(-1))
-        weights = weights.view(-1)
-        loss_fct = torch.nn.KLDivLoss(log_target=True, reduction='none')
-        loss = loss_fct(inputs, targets)
-        loss = loss.sum(dim=1)
+        if probs.dim() < 3:
+            probs = probs.unsqueeze(1)  # Add dimension if needed to match target shape
+        gathered_probs = torch.gather(probs, -1, targets.unsqueeze(-1)).squeeze(-1)
+        loss = -torch.log(torch.clamp(1.0 - gathered_probs, min=1e-5))
+    elif loss_type in loss_fns:
+        loss_fn = loss_fns[loss_type]
+        loss = loss_fn(inputs, targets)
+        if loss_type == 'kl':
+            loss = loss.sum(dim=1)
     else:
-        assert False
-
-    loss = loss[weights != 0]
-    return loss.mean()
-
-def get_logits_from_lm(lm, inputs, control_ids):
-    if control_ids is not None:
-        past = lm.get_past_from_prefix(control_ids)
-    else:
-        past = None
-    outputs = lm(inputs, past_key_values=past)
-    shift_logits = outputs.logits[..., :-1, :]
-    shift_labels = inputs[..., 1:].unsqueeze(-1)
-    shift_probs = F.softmax(shift_logits, dim=-1)
-    return shift_logits.squeeze(0), torch.gather(shift_probs, 2, shift_labels).squeeze(-1).squeeze(0)
+        raise ValueError(f"Unsupported loss type: {loss_type}")
+    
+    return loss[weights != 0].mean()
 
 class Trainer:
     def __init__(self, args):
