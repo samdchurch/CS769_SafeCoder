@@ -19,100 +19,56 @@ import pickle
 
 class Timer:
     """
-    An object that keeps track of our progress in some repetitive loop and outputs a time estimate of the remaining time
-    we will need to finish our loop. It is a handy tool for line and or grid searches, or sequential monte carlo
-    simulations. Note that if the constituting steps in the loop(s) take vastly different times, the time estimate can
-    be arbitrarily off, however the overall progress will still be displayed.
+    A utility to track time elapsed and estimate time remaining in iterative processes.
     """
 
     def __init__(self, total_steps):
         """
-        Constructor.
-
-        :param total_steps: (int) The total number of steps the measured process will make.
+        Initializes the timer for a process with a known total number of steps.
+        
+        :param total_steps: Total number of steps in the process.
         """
         self.total_steps = total_steps
-        self.total_time_elapsed = 0.
+        self.total_time_elapsed = 0.0
         self.recorded_steps = 0
         self.running_avg = None
         self.last_measured_time = None
-
-        # time estimates
-        self.remaining_seconds = None
-        self.remaining_minutes = None
-        self.remaining_hours = None
-
-        # completion
-        self.completion = 0.
+        self.completion = 0.0
 
     def __str__(self):
         self._calculate_completion_and_time_remaining()
-        spaces = '          '  # to account for overhanging lines :)
-        return f'{int(self.completion * 100)}%: {self.remaining_hours}h {self.remaining_minutes}m {self.remaining_seconds}s{spaces}'
+        return f"{int(self.completion * 100)}% complete: {self.remaining_hours}h {self.remaining_minutes}m {self.remaining_seconds}s"
 
     def start(self):
-        """
-        Mark the start of the innermost loop over which you wish to measure and record the current clock time.
-
-        :return: None
-        """
+        """Records the start time of a step."""
         self.last_measured_time = time()
 
     def end(self):
-        """
-        Mark the end of the innermost loop over which you wish to measure and record the current clock time. Eventually,
-        update the running average estimate and add a step to the completed ones.
-
-        :return: None
-        """
-        recorded_time = time() - self.last_measured_time
-        self.total_time_elapsed += recorded_time
-        if self.running_avg is None:
-            self.running_avg = recorded_time
-        else:
-            self.running_avg = (self.running_avg * self.recorded_steps + recorded_time) / (self.recorded_steps + 1)
+        """Records the end time of a step and updates the running average time per step."""
+        elapsed = time() - self.last_measured_time
+        self.total_time_elapsed += elapsed
         self.recorded_steps += 1
+        self.running_avg = elapsed if self.running_avg is None else (self.running_avg * (self.recorded_steps - 1) + elapsed) / self.recorded_steps
+
+    def _calculate_completion_and_time_remaining(self):
+        """Calculates the percentage completion and estimates the remaining time based on the average step duration."""
+        remaining_steps = self.total_steps - self.recorded_steps
+        self.completion = self.recorded_steps / self.total_steps if self.total_steps > 0 else 0
+        estimated_time_remaining = remaining_steps * self.running_avg if self.running_avg else 0
+        self.remaining_hours, self.remaining_minutes, self.remaining_seconds = self._convert_seconds_to_h_m_s(estimated_time_remaining)
 
     @staticmethod
     def _convert_seconds_to_h_m_s(seconds):
-        """
-        A private method to convert seconds into hours, minutes and seconds for better human readability.
-
-        :param seconds: (int) Seconds we wish to convert into h, m, s format.
-        :return: (tuple) The amount of seconds given converted into h, m, s format.
-        """
+        """Converts a duration in seconds to hours, minutes, and seconds."""
         hours = int(seconds // 3600)
-        minutes = int((seconds - hours * 3600) // 60)
-        rem_seconds = int(seconds - hours * 3600 - minutes * 60)
-        return hours, minutes, rem_seconds
-
-    def _calculate_completion_and_time_remaining(self):
-        """
-        Private method to compute the completion of the process and estimate the remaining time from the running
-        average.
-
-        :return: None
-        """
-        remaining = self.total_steps - self.recorded_steps
-        self.completion = self.recorded_steps / self.total_steps
-        if self.running_avg is not None:
-            estimated_time = remaining * self.running_avg
-            self.remaining_hours, self.remaining_minutes, self.remaining_seconds = self._convert_seconds_to_h_m_s(estimated_time)
-        else:
-            self.remaining_hours = '??'
-            self.remaining_minutes = '??'
-            self.remaining_seconds = '??'
+        minutes = int((seconds % 3600) // 60)
+        seconds = int(seconds % 60)
+        return hours, minutes, seconds
 
     def duration(self):
-        """
-        After the process has finished call this method to display the absolute time the completion of the whole process
-        has taken.
-
-        :return: None
-        """
-        h, m, s = self._convert_seconds_to_h_m_s(self.total_time_elapsed)
-        print('\n')
-        print(f'Completed. Time Elapsed: {h}h {m}m {s}s')
+        """Displays the total elapsed time after the process completes."""
+        hours, minutes, seconds = self._convert_seconds_to_h_m_s(self.total_time_elapsed)
+        print(f"Completed in {hours}h {minutes}m {seconds}s")
 
 
 class CodeDataset(Dataset):
@@ -132,70 +88,49 @@ class CodeDataset(Dataset):
 
 class LossDict:
     def __init__(self, keys):
-        self.d = OrderedDict()
-        self.keys = keys
-        for key in keys:
-            self.d[key] = list()
+        self.loss_data = {key: [] for key in keys}
 
     def step(self, other):
-        for k in other.d:
-            self.d[k] += other.d[k]
+        for key, values in other.loss_data.items():
+            self.loss_data[key].extend(values)
 
     def pretty_print(self, args):
-        p = []
-        for k, l in self.d.items():
-            if len(l) > 0:
-                s = sum(l) / len(l) / args.grad_acc_steps
-                p.append(f'{k}: {round(s, 6)}')
-        return ', '.join(p)
+        return ", ".join(f"{key}: {round(sum(values) / len(values) / args.grad_acc_steps, 6)}" 
+                         for key, values in self.loss_data.items() if values)
 
     def clear(self):
-        for key in self.keys:
-            self.d[key].clear()
+        for key in self.loss_data:
+            self.loss_data[key].clear()
 
-    def __getitem__(self, k):
-        return self.d[k]
+    def __getitem__(self, key):
+        return self.loss_data[key]
 
 def token_weighted_loss(loss_type, inputs, targets, weights):
-    if loss_type == 'ce':
-        inputs = inputs.view(-1, inputs.size(-1))
-        targets = targets.view(-1)
-        weights = weights.view(-1)
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fct(inputs, targets)
-    elif loss_type == 'nll':
-        inputs = inputs.view(-1, inputs.size(-1))
-        targets = targets.view(-1)
-        weights = weights.view(-1)
-        loss_fct = torch.nn.NLLLoss(reduction='none')
-        loss = loss_fct(inputs, targets)
-    elif loss_type == 'ul':
+    inputs, targets, weights = inputs.view(-1, inputs.size(-1)), targets.view(-1), weights.view(-1)
+    loss_fn = {
+        'ce': torch.nn.CrossEntropyLoss(reduction="none"),
+        'nll': torch.nn.NLLLoss(reduction="none"),
+        'kl': torch.nn.KLDivLoss(log_target=True, reduction="none")
+    }.get(loss_type)
+
+    if loss_type == 'ul':
         probs = F.softmax(inputs, dim=-1)
         probs = torch.gather(probs, 2, targets.unsqueeze(-1)).squeeze(-1)
-        probs = torch.clamp((1.0-probs), min=1e-5)
-        loss = -torch.log(probs)
-    elif loss_type == 'kl':
-        inputs = inputs.view(-1, inputs.size(-1))
-        targets = targets.view(-1, targets.size(-1))
-        weights = weights.view(-1)
-        loss_fct = torch.nn.KLDivLoss(log_target=True, reduction='none')
-        loss = loss_fct(inputs, targets)
-        loss = loss.sum(dim=1)
+        loss = -torch.log(torch.clamp(1.0 - probs, min=1e-5))
     else:
-        assert False
+        loss = loss_fn(inputs, targets) if loss_fn else None
+        if loss is None:
+            raise ValueError("Unsupported loss type.")
+    
+    return loss[weights != 0].mean()
 
-    loss = loss[weights != 0]
-    return loss.mean()
-
-def get_logits_from_lm(lm, inputs, control_ids):
-    if control_ids is not None:
-        past = lm.get_past_from_prefix(control_ids)
-    else:
-        past = None
+def get_logits_from_lm(lm, inputs, control_ids=None):
+    past = lm.get_past_from_prefix(control_ids) if control_ids is not None else None
     outputs = lm(inputs, past_key_values=past)
     shift_logits = outputs.logits[..., :-1, :]
     shift_labels = inputs[..., 1:].unsqueeze(-1)
     shift_probs = F.softmax(shift_logits, dim=-1)
+    
     return shift_logits.squeeze(0), torch.gather(shift_probs, 2, shift_labels).squeeze(-1).squeeze(0)
 
 class Trainer:
@@ -263,29 +198,26 @@ class Trainer:
         torch.manual_seed(seed)
 
     def load_model_util(self, model_name, args):
-        """
-        Important note:
-        This load function will only work for lora models if they are saved in the following pattern:
-            <pretrained_base_model_name>-lora<whatever_else>
-        """
-
         if model_name in PRETRAINED_MODELS:
             model_dir = PRETRAINED_MODELS[model_name]
         elif model_name in CHAT_MODELS:
             model_dir = CHAT_MODELS[model_name]
         else:
-            if 'checkpoint-epoch' in model_name:
-                model_dir = os.path.join(args.model_dir, model_name)
-            else:
-                model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-            assert os.path.exists(model_dir)
+            checkpoint_dir = model_name if "checkpoint-epoch" in model_name else "checkpoint-last"
+            model_dir = os.path.join(args.model_dir, model_name, checkpoint_dir)
+            assert os.path.exists(model_dir), f"Model directory {model_dir} does not exist."
 
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
-            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
-        else:    
-            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
+        model_kwargs = {
+            "device_map": "auto",
+            "trust_remote_code": True,
+            "vocab_size": len(tokenizer) if model_name not in PRETRAINED_MODELS and model_name != "deepseek" else None
+        }
+        model_kwargs = {k: v for k, v in model_kwargs.items() if v is not None}
+        
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
         model.resize_token_embeddings(len(tokenizer))
+        
         return tokenizer, model
 
     def load_model(self):
@@ -347,8 +279,10 @@ class Trainer:
         global_step, acc_loss_dict = 0, LossDict(self.loss_keys)
         self.set_seed_util(self.args.seed)
         timer = Timer(total_steps)
+
         timer.start()
         self.model.train()
+        print("here-----------------------------")
         for idx in range(self.args.num_train_epochs):
             for step, batch in enumerate(train_dataloader):
                 loss, loss_dict = self.step(batch)
