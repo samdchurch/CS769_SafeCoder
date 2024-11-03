@@ -198,26 +198,29 @@ class Trainer:
         torch.manual_seed(seed)
 
     def load_model_util(self, model_name, args):
+        """
+        Important note:
+        This load function will only work for lora models if they are saved in the following pattern:
+            <pretrained_base_model_name>-lora<whatever_else>
+        """
+
         if model_name in PRETRAINED_MODELS:
             model_dir = PRETRAINED_MODELS[model_name]
         elif model_name in CHAT_MODELS:
             model_dir = CHAT_MODELS[model_name]
         else:
-            checkpoint_dir = model_name if "checkpoint-epoch" in model_name else "checkpoint-last"
-            model_dir = os.path.join(args.model_dir, model_name, checkpoint_dir)
-            assert os.path.exists(model_dir), f"Model directory {model_dir} does not exist."
+            if 'checkpoint-epoch' in model_name:
+                model_dir = os.path.join(args.model_dir, model_name)
+            else:
+                model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+            assert os.path.exists(model_dir)
 
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        model_kwargs = {
-            "device_map": "auto",
-            "trust_remote_code": True,
-            "vocab_size": len(tokenizer) if model_name not in PRETRAINED_MODELS and model_name != "deepseek" else None
-        }
-        model_kwargs = {k: v for k, v in model_kwargs.items() if v is not None}
-        
-        model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
+        if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
+            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
+        else:    
+            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
         model.resize_token_embeddings(len(tokenizer))
-        
         return tokenizer, model
 
     def load_model(self):
