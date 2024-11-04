@@ -18,16 +18,8 @@ import pickle
 
 
 class Timer:
-    """
-    A utility to track time elapsed and estimate time remaining in iterative processes.
-    """
 
     def __init__(self, total_steps):
-        """
-        Initializes the timer for a process with a known total number of steps.
-        
-        :param total_steps: Total number of steps in the process.
-        """
         self.total_steps = total_steps
         self.total_time_elapsed = 0.0
         self.recorded_steps = 0
@@ -40,18 +32,15 @@ class Timer:
         return f"{int(self.completion * 100)}% complete: {self.remaining_hours}h {self.remaining_minutes}m {self.remaining_seconds}s"
 
     def start(self):
-        """Records the start time of a step."""
         self.last_measured_time = time()
 
     def end(self):
-        """Records the end time of a step and updates the running average time per step."""
         elapsed = time() - self.last_measured_time
         self.total_time_elapsed += elapsed
         self.recorded_steps += 1
         self.running_avg = elapsed if self.running_avg is None else (self.running_avg * (self.recorded_steps - 1) + elapsed) / self.recorded_steps
 
     def _calculate_completion_and_time_remaining(self):
-        """Calculates the percentage completion and estimates the remaining time based on the average step duration."""
         remaining_steps = self.total_steps - self.recorded_steps
         self.completion = self.recorded_steps / self.total_steps if self.total_steps > 0 else 0
         estimated_time_remaining = remaining_steps * self.running_avg if self.running_avg else 0
@@ -59,14 +48,12 @@ class Timer:
 
     @staticmethod
     def _convert_seconds_to_h_m_s(seconds):
-        """Converts a duration in seconds to hours, minutes, and seconds."""
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         seconds = int(seconds % 60)
         return hours, minutes, seconds
 
     def duration(self):
-        """Displays the total elapsed time after the process completes."""
         hours, minutes, seconds = self._convert_seconds_to_h_m_s(self.total_time_elapsed)
         print(f"Completed in {hours}h {minutes}m {seconds}s")
 
@@ -212,11 +199,6 @@ class Trainer:
         torch.manual_seed(seed)
 
     def load_model_util(self, model_name, args):
-        """
-        Important note:
-        This load function will only work for lora models if they are saved in the following pattern:
-            <pretrained_base_model_name>-lora<whatever_else>
-        """
 
         if model_name in PRETRAINED_MODELS:
             model_dir = PRETRAINED_MODELS[model_name]
@@ -250,9 +232,7 @@ class Trainer:
         self.val_dataset = CodeDataset(self.args, self.tokenizer, 'val')
 
     def save(self, path):
-        """
-        For normal models this saves the whole set of weights, for LoRA models it saves the adapter.
-        """
+
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
     
