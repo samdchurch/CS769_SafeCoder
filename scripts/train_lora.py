@@ -2,7 +2,7 @@ import os
 import argparse
 
 from safecoder.utils import set_seed, set_logging
-from safecoder.trainer import Trainer
+from safecoder.trainer_lora import Trainer
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -48,6 +48,7 @@ def get_args():
     args = parser.parse_args()
 
     # Adjust naming convention based on flags
+    args.use_lora = args.lora  # Map lora flag to use_lora
     if args.lora and not args.output_name.startswith(f'{args.pretrain_name}-lora'):
         args.output_name = f'{args.pretrain_name}-lora-' + args.output_name
 
