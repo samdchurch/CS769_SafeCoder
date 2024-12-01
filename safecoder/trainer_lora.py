@@ -135,52 +135,6 @@ class Trainer:
         if self.args.kl_loss_weight > 0:
             self.loss_keys.append('kl')
 
-    def load_model_util(self, model_name, args):
-        # Original logic to handle model loading from PRETRAINED_MODELS, CHAT_MODELS, or Hugging Face
-        if model_name in PRETRAINED_MODELS:
-            model_dir = PRETRAINED_MODELS[model_name]
-        elif model_name in CHAT_MODELS:
-            model_dir = CHAT_MODELS[model_name]
-        else:
-            if 'checkpoint-epoch' in model_name:
-                model_dir = os.path.join(args.model_dir, model_name)
-            else:
-                model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-            assert os.path.exists(model_dir)
-
-        tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map='auto',
-            trust_remote_code=True
-        )
-        model.resize_token_embeddings(len(tokenizer))
-        return tokenizer, model
-
-    def load_model(self):
-        # Load base model and tokenizer
-        self.tokenizer, self.model = self.load_model_util(self.args.pretrain_name, self.args)
-        self.model.train()
-        print("here------------------------------")
-        print(self.model)
-        # If LoRA is enabled, modify the model with LoRA configurations
-        if self.args.lora:
-            lora_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=self.args.r,
-                lora_alpha=self.args.lora_alpha,
-                lora_dropout=self.args.lora_dropout,
-                target_modules=["attn.c_proj"]  # Focus on output projection
-            )
-
-
-            self.model = get_peft_model(self.model, lora_config)
-            self.args.logger.info(f"LoRA model initialized with config: {lora_config}")
-
-        # Reference model for KL divergence if required
-        if self.args.kl_loss_weight > 0 and not self.args.sven:
-            _, self.ref_model = self.load_model_util(self.args.pretrain_name, self.args)
-            self.ref_model.eval()
     def step(self, batch):
         loss_dict = LossDict(self.loss_keys)
         sample_types, inputs, weights = batch
@@ -238,63 +192,158 @@ class Trainer:
             loss, loss_dict = self.step(batch)
             acc_loss_dict.step(loss_dict)
         return acc_loss_dict.pretty_print(self.args)
-    def load_dataset(self):
-        self.dataset = CodeDataset(self.args, self.tokenizer, 'train')
-        self.val_dataset = CodeDataset(self.args, self.tokenizer, 'val')
+
     def set_seed_util(self, seed):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-    def _configure_optimizer(self):
-        if self.args.lora:
-            # Only optimize LoRA parameters
-            parameters = [p for p in self.model.parameters() if p.requires_grad]
+
+    def load_model_util(self, model_name, args):
+
+        if model_name in PRETRAINED_MODELS:
+            model_dir = PRETRAINED_MODELS[model_name]
+        elif model_name in CHAT_MODELS:
+            model_dir = CHAT_MODELS[model_name]
         else:
-            # Standard optimizer logic for the entire model
-            no_decay = ["bias", "LayerNorm.weight"]
-            parameters = [
-                {
-                    "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad],
-                    "weight_decay": self.args.weight_decay
-                },
-                {
-                    "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad],
-                    "weight_decay": 0.0
-                }
-            ]
-        return AdamW(parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+            if 'checkpoint-epoch' in model_name:
+                model_dir = os.path.join(args.model_dir, model_name)
+            else:
+                model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
+            assert os.path.exists(model_dir)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
+            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
+        else:    
+            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
+        model.resize_token_embeddings(len(tokenizer))
+        return tokenizer, model
+
+    def load_model(self):
+        self.tokenizer, self.model = self.load_model_util(self.args.pretrain_name, self.args)
+        self.model.train()
+
+        if self.args.kl_loss_weight > 0 and not self.args.sven:
+            _, self.ref_model = self.load_model_util(self.args.pretrain_name, self.args)
+            self.ref_model.eval()
+
+    def load_dataset(self):
+        self.dataset = CodeDataset(self.args, self.tokenizer, 'train')
+        self.val_dataset = CodeDataset(self.args, self.tokenizer, 'val')
+
+    def save(self, path):
+
+        if self.args.sven:
+            os.makedirs(path, exist_ok=True)
+            prefix_file = os.path.join(path, 'pytorch_model.bin')
+            state_dict = self.model.prefix_params.state_dict()
+            for k, v in state_dict.items():
+                state_dict[k] = v.cpu()
+            torch.save(state_dict, prefix_file)
+        else:
+            self.model.save_pretrained(path)
+            self.tokenizer.save_pretrained(path)
+    
+    def create_lora_config(self):
+        """
+        Includes all linear layers in the LoRA training.
+        """
+        self.lora_config = LoraConfig(
+            r=self.args.r,
+            target_modules=list(set([name for name in re.findall(r'\((\w+)\): Linear', str(self.model.modules))])),
+            lora_alpha=self.args.lora_alpha,
+            lora_dropout=self.args.lora_dropout,
+            task_type="CAUSAL_LM"
+        )
+
+    def _configure_optimizer(self):
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad],
+                "weight_decay": self.args.weight_decay
+            },
+            {
+                "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad],
+                "weight_decay": 0.0
+            }
+        ]
+        return AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+
+    def _log_training_details(self, num_samples, batch_size, total_steps, num_val_samples):
+        self.args.logger.info("***** Running training *****")
+        self.args.logger.info(f"  Num samples = {num_samples}")
+        self.args.logger.info(f"  Num epochs = {self.args.num_train_epochs}")
+        self.args.logger.info(f"  Batch size (no accumulation) = {self.args.batch_size}")
+        self.args.logger.info(f"  Total batch size (with accumulation) = {batch_size}")
+        self.args.logger.info(f"  Gradient accumulation steps = {self.args.grad_acc_steps}")
+        self.args.logger.info(f"  Total optimization steps = {total_steps}")
+        self.args.logger.info(f"  Num validation samples = {num_val_samples}")
+
+    def _save_checkpoint(self, epoch):
+        self.model.eval()
+        with torch.no_grad():
+            eval_loss_pp = self.do_eval()
+        self.args.logger.info(f"Validation loss for epoch {epoch}: {eval_loss_pp}")
+        output_dir = os.path.join(self.args.output_dir, f"checkpoint-epoch-{epoch}")
+        last_output_dir = os.path.join(self.args.output_dir, "checkpoint-last")
+        self.args.logger.info(f"Saving model checkpoint to {output_dir} and {last_output_dir}")
+        self.save(output_dir)
+        self.save(last_output_dir)
+
+    def _save_final_checkpoint(self):
+        self.model.eval()
+        with torch.no_grad():
+            eval_loss_pp = self.do_eval()
+        last_output_dir = os.path.join(self.args.output_dir, "checkpoint-last")
+        self.args.logger.info(f"Final validation loss: {eval_loss_pp}")
+        self.args.logger.info(f"Saving final model checkpoint to {last_output_dir}")
+        self.save(last_output_dir)
+
 
     def run(self):
-        # Load the model and dataset
         self.load_model()
         self.load_dataset()
+        print("line 230 before lora----------") 
+        if self.args.lora:
+            print("LORA+-===========------------------")
+            self.create_lora_config()
+            self.model = get_peft_model(self.model, self.lora_config)
 
-        # Prepare dataloader
+        self.args.logger.info(f'Training args {self.args}')
+
+        # Configuration for batch and steps
+        batch_size = self.args.batch_size * self.args.grad_acc_steps
+        total_steps = (len(self.dataset) // batch_size) * self.args.num_train_epochs
+
         train_dataloader = DataLoader(
-            self.dataset,
-            sampler=RandomSampler(self.dataset),
-            batch_size=self.args.batch_size,
+            self.dataset, 
+            sampler=RandomSampler(self.dataset), 
+            batch_size=self.args.batch_size, 
             drop_last=True
         )
 
-        # Configure optimizer and scheduler
+        # Optimizer and Scheduler
         optimizer = self._configure_optimizer()
         scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.args.warmup_steps,
-            num_training_steps=(len(train_dataloader) * self.args.num_train_epochs)
+            optimizer, 
+            num_warmup_steps=self.args.warmup_steps, 
+            num_training_steps=total_steps
         )
 
-        # Training loop
+        # Logging details
+        self._log_training_details(len(self.dataset), batch_size, total_steps, len(self.val_dataset))
+
         global_step, acc_loss_dict = 0, LossDict(self.loss_keys)
         self.set_seed_util(self.args.seed)
-        timer = Timer(total_steps=(len(train_dataloader) * self.args.num_train_epochs))
+        timer = Timer(total_steps)
         timer.start()
 
         for epoch in range(self.args.num_train_epochs):
             self.model.train()
             for step, batch in enumerate(train_dataloader):
                 loss, loss_dict = self.step(batch)
+
                 loss /= self.args.grad_acc_steps
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
@@ -303,23 +352,23 @@ class Trainer:
                 if (step + 1) % self.args.grad_acc_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
-                    scheduler.step()
+                    scheduler.step()  
                     global_step += 1
 
                     if global_step % self.args.logging_steps == 0:
                         acc_loss_pp = acc_loss_dict.pretty_print(self.args)
                         self.args.logger.info(
                             f"Epoch: {epoch + 1}/{self.args.num_train_epochs}, "
-                            f"Step: {global_step}, Loss: {acc_loss_pp}, Timer: {timer}"
+                            f"Step: {global_step}/{total_steps}, Loss: {acc_loss_pp}, Timer: {timer}"
                         )
                         acc_loss_dict.clear()
 
                     timer.end()
                     timer.start()
 
-            # Save checkpoint after each epoch
-            self._save_checkpoint(epoch + 1)
+            if (epoch + 1) % self.args.save_epochs == 0:
+                self._save_checkpoint(epoch + 1)
 
-        # Final checkpoint
-        self._save_final_checkpoint()
-
+        # Final checkpoint if not saved at last epoch
+        if (epoch + 1) % self.args.save_epochs != 0:
+            self._save_final_checkpoint()
