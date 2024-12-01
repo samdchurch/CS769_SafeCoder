@@ -5,9 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
 from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, AutoModelForCausalLM
-#from peft import LoraConfig, get_peft_model, LoraConfig, TaskType
-from peft import PrefixTuningConfig, get_peft_model, TaskType
-
+from peft import PrefixTuningConfig, PromptTuningConfig, get_peft_model, TaskType
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
 import random
 
@@ -94,6 +92,7 @@ class LossDict:
     def __getitem__(self, key):
         return self.loss_data[key]
 
+
 def token_weighted_loss(loss_type, inputs, targets, weights):
     inputs = inputs.view(-1, inputs.size(-1))
     targets = targets.view(-1)
@@ -147,6 +146,7 @@ class Trainer:
         shift_weights = weights[..., 1:]
         
         outputs = self.model(inputs)
+        #outputs.logits = outputs.logits[:, 10:, :]
         shift_logits = outputs.logits[..., :-1, :]
 
         total_loss = 0.0
@@ -219,21 +219,57 @@ class Trainer:
         else:    
             model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
         model.resize_token_embeddings(len(tokenizer))
+        return tokenizer, model
+    
+    def load_model2(self, model_path):
+        
+        self.tokenizer, self.model = self.load_model_path(model_path, self.args)
+        self.model.train()
 
+        print(self.model)
+
+        # Define Prefix Tuning configuration
         prefix_config = PrefixTuningConfig(
-            task_type=TaskType.CAUSAL_LM, 
-            num_virtual_tokens=self.args.num_prefix_tokens, 
-            token_dim=model.config.hidden_size
+            task_type=TaskType.CAUSAL_LM,
+            num_virtual_tokens=10
         )
 
-        model = get_peft_model(model, prefix_config)
+        # prompt_config = PromptTuningConfig(
+        #     task_type="CAUSAL_LM",
+        #     num_virtual_tokens=10
+        # )
 
-        return tokenizer, model
+        # Apply PEFT's prefix tuning to the model
+        self.model = get_peft_model(self.model, prefix_config)
+
+        # Freeze the base model's parameters
+        # for param in self.model.base_model.parameters():
+        #     param.requires_grad = False
+
+    
 
     def load_model(self):
         self.tokenizer, self.model = self.load_model_util(self.args.pretrain_name, self.args)
         self.model.train()
+        print(self.model)
+        # Define Prefix Tuning configuration
+        prefix_config = PrefixTuningConfig(
+            task_type="CAUSAL_LM",  # Specify the task type
+            num_virtual_tokens=30,  # Number of prefix tokens
+            num_prefix_tokens=30,
+            num_hidden_layers=self.model.config.num_layers,  # Number of layers in the base model
+            num_attention_heads=self.model.config.num_attention_heads,
+            prefix_projection=True,
+            prefix_dropout=0.1,
+        )
 
+        # Apply PEFT's prefix tuning to the model
+        self.model = get_peft_model(self.model, prefix_config)
+
+        # Freeze the base model's parameters
+        for param in self.model.base_model.parameters():
+            param.requires_grad = False
+        print(self.model)
         if self.args.kl_loss_weight > 0 and not self.args.sven:
             _, self.ref_model = self.load_model_util(self.args.pretrain_name, self.args)
             self.ref_model.eval()
@@ -249,10 +285,17 @@ class Trainer:
     
 
     def _configure_optimizer(self):
-        optimizer_grouped_parameters = [
-            {"params": [p for n, p in self.model.named_parameters() if "prefix" in n and p.requires_grad]}
-        ]
-        return AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+        # Only train the prefix tuning parameters
+        # optimizer_grouped_parameters = [
+        #     {
+        #         "params": [p for p in self.model.parameters() if p.requires_grad],
+        #         "weight_decay": self.args.weight_decay
+        #     }
+        # ]
+        for n, p in self.model.named_parameters():
+            if p.requires_grad:
+                print(n)
+        return AdamW([p for p in self.model.parameters() if p.requires_grad], lr=self.args.learning_rate, eps=self.args.adam_epsilon)
 
     def _log_training_details(self, num_samples, batch_size, total_steps, num_val_samples):
         self.args.logger.info("***** Running training *****")
@@ -275,6 +318,31 @@ class Trainer:
         self.save(output_dir)
         self.save(last_output_dir)
 
+    def load_model_path(self, model_path, args):
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        # Load model
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, 
+            device_map='auto', 
+            trust_remote_code=True
+        )
+
+        model.resize_token_embeddings(len(tokenizer))
+
+        # if self.args.num_prefix_tokens > 0:
+        #     print('NUM PREFIX TOKENS:', self.args.num_prefix_tokens)
+        #     print('MODEL CONFIG HIDDEN SIZE:', model.config.hidden_size)
+        #     prefix_config = PrefixTuningConfig(
+        #         task_type=TaskType.CAUSAL_LM,
+        #         num_virtual_tokens=self.args.num_prefix_tokens,
+        #         token_dim=model.config.hidden_size
+        #     )
+        #     model = get_peft_model(model, prefix_config)
+
+        return tokenizer, model
+
+
     def _save_final_checkpoint(self):
         self.model.eval()
         with torch.no_grad():
@@ -284,9 +352,18 @@ class Trainer:
         self.args.logger.info(f"Saving final model checkpoint to {last_output_dir}")
         self.save(last_output_dir)
 
+    def print_graph(self, node, indent=0):
+        if node is None:
+            return
+        print(" " * indent, type(node).__name__)
+        if hasattr(node, 'next_functions'):
+            for sub_node in node.next_functions:
+                if sub_node[0] is not None:
+                    self.print_graph(sub_node[0], indent + 4)
+
 
     def run(self):
-        self.load_model()
+        self.load_model2(model_path='/app/UserData/Sam/nlp/CS769_SafeCoder/pretrained_models/starcoderbase-1b')
         self.load_dataset()
 
         self.args.logger.info(f'Training args {self.args}')
@@ -330,6 +407,9 @@ class Trainer:
 
                 if (step + 1) % self.args.grad_acc_steps == 0:
                     optimizer.step()
+                    for n, p in self.model.named_parameters():
+                        if p.requires_grad:
+                            print(p.grad)
                     optimizer.zero_grad()
                     scheduler.step()  
                     global_step += 1
