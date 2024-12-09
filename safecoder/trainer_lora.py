@@ -310,7 +310,7 @@ class Trainer:
     def run(self):
         wandb.init(
             project="safecoder_lora",  # Replace with your W&B project name
-            name=self.args.experiment_name,  # Experiment name for tracking
+            name="safecoder_lora",  # Experiment name for tracking
             config={
                 "batch_size": self.args.batch_size,
                 "num_train_epochs": self.args.num_train_epochs,
