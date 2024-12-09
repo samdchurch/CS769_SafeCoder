@@ -16,6 +16,8 @@ from .constants import PRETRAINED_MODELS, CHAT_MODELS
 from time import time
 import pickle
 
+import wandb  # Import W&B
+
 
 class Timer:
 
@@ -191,7 +193,11 @@ class Trainer:
             # loss, loss_dict = self.sven_step(batch) if self.args.sven else 
             loss, loss_dict = self.step(batch)
             acc_loss_dict.step(loss_dict)
-        return acc_loss_dict.pretty_print(self.args)
+        eval_loss_pp = acc_loss_dict.pretty_print(self.args)
+        wandb.log({
+            "validation_loss": float(eval_loss_pp.split(": ")[-1]) if eval_loss_pp else 0.0,
+        })
+        return eval_loss_pp
 
     def set_seed_util(self, seed):
         random.seed(seed)
@@ -302,6 +308,17 @@ class Trainer:
 
 
     def run(self):
+        wandb.init(
+            project="safecoder_lora",  # Replace with your W&B project name
+            name=self.args.experiment_name,  # Experiment name for tracking
+            config={
+                "batch_size": self.args.batch_size,
+                "num_train_epochs": self.args.num_train_epochs,
+                "learning_rate": self.args.learning_rate,
+                "grad_acc_steps": self.args.grad_acc_steps,
+                "lora": self.args.lora,
+            },
+        )
         self.load_model()
         self.load_dataset()
         print("line 230 before lora----------") 
@@ -355,6 +372,13 @@ class Trainer:
                     scheduler.step()  
                     global_step += 1
 
+                    # Log training loss to W&B
+                    wandb.log({
+                        "train_loss": loss.item(),
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                    })
+
                     if global_step % self.args.logging_steps == 0:
                         acc_loss_pp = acc_loss_dict.pretty_print(self.args)
                         self.args.logger.info(
@@ -366,9 +390,14 @@ class Trainer:
                     timer.end()
                     timer.start()
 
+
+
+
             if (epoch + 1) % self.args.save_epochs == 0:
                 self._save_checkpoint(epoch + 1)
 
         # Final checkpoint if not saved at last epoch
         if (epoch + 1) % self.args.save_epochs != 0:
             self._save_final_checkpoint()
+        
+        wandb.finish()
