@@ -360,6 +360,13 @@ class Trainer:
                             f"Epoch: {epoch + 1}/{self.args.num_train_epochs}, "
                             f"Step: {global_step}/{total_steps}, Loss: {acc_loss_pp}, Timer: {timer}"
                         )
+                        # Log training loss to W&B
+                        wandb.log({
+                            "train_loss": loss.item(),
+                            "acc_loss": acc_loss_pp,
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                        })
                         acc_loss_dict.clear()
 
                     timer.end()
