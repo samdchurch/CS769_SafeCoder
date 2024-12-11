@@ -321,9 +321,7 @@ class Trainer:
         )
         self.load_model()
         self.load_dataset()
-        print("line 230 before lora----------") 
         if self.args.lora:
-            print("LORA+-===========------------------")
             self.create_lora_config()
             self.model = get_peft_model(self.model, self.lora_config)
 
@@ -377,6 +375,9 @@ class Trainer:
                         "train_loss": loss.item(),
                         "epoch": epoch + 1,
                         "global_step": global_step,
+                        "loss_func": loss_dict["func"].item(),
+                        "loss_pos": loss_dict["pos"].item(),
+                        "loss_neg": loss_dict["neg"].item(),
                     })
 
                     if global_step % self.args.logging_steps == 0:
