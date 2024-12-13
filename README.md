@@ -14,3 +14,9 @@ Finally, set up different programming languages studied in this work (`sudo` rig
 ```console
 ./setup_langs.sh
 ```
+
+## Training
+# Full fine-tuning
+# LoRA
+# Prefix Tuning
+# DPO
