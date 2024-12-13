@@ -16,7 +16,7 @@ Finally, set up different programming languages studied in this work (`sudo` rig
 ```
 
 ## Training
-# Full fine-tuning
-# LoRA
-# Prefix Tuning
-# DPO
+### Full fine-tuning
+### LoRA
+### Prefix Tuning
+### DPO
