@@ -33,6 +33,7 @@ def get_args():
     parser.add_argument('--no_weights', action='store_true', default=False)
 
     # prefix args
+    parser.add_argument('--prefix_tuning', action='store_true', default=False, help='Toggle to use lora in training')
     parser.add_argument('--num_prefix_tokens', type=int, default=10)
 
     # lora arguments
