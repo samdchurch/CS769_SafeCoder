@@ -4,127 +4,82 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
-from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer, AutoModelForCausalLM
-from peft import PrefixTuningConfig, PromptTuningConfig, get_peft_model, TaskType
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
-import random
+from transformers import AdamW, get_linear_schedule_with_warmup
+from peft import LoraConfig, get_peft_model, LoraConfig, TaskType, PrefixTuningConfig
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
-# from .dataset import CodeDataset
+from .utils import set_seed, load_model
+from .timer import Timer
+from .dataset import CodeDataset
 from .constants import FUNC, GOOD, BAD
-from .constants import PRETRAINED_MODELS, CHAT_MODELS
-
-from time import time
-import pickle
-
-
-class Timer:
-
-    def __init__(self, total_steps):
-        self.total_steps = total_steps
-        self.total_time_elapsed = 0.0
-        self.recorded_steps = 0
-        self.running_avg = None
-        self.last_measured_time = None
-        self.completion = 0.0
-
-    def __str__(self):
-        self._calculate_completion_and_time_remaining()
-        return f"{int(self.completion * 100)}% complete: {self.remaining_hours}h {self.remaining_minutes}m {self.remaining_seconds}s"
-
-    def start(self):
-        self.last_measured_time = time()
-
-    def end(self):
-        elapsed = time() - self.last_measured_time
-        self.total_time_elapsed += elapsed
-        self.recorded_steps += 1
-        self.running_avg = elapsed if self.running_avg is None else (self.running_avg * (self.recorded_steps - 1) + elapsed) / self.recorded_steps
-
-    def _calculate_completion_and_time_remaining(self):
-        remaining_steps = self.total_steps - self.recorded_steps
-        self.completion = self.recorded_steps / self.total_steps if self.total_steps > 0 else 0
-        estimated_time_remaining = remaining_steps * self.running_avg if self.running_avg else 0
-        self.remaining_hours, self.remaining_minutes, self.remaining_seconds = self._convert_seconds_to_h_m_s(estimated_time_remaining)
-
-    @staticmethod
-    def _convert_seconds_to_h_m_s(seconds):
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        seconds = int(seconds % 60)
-        return hours, minutes, seconds
-
-    def duration(self):
-        hours, minutes, seconds = self._convert_seconds_to_h_m_s(self.total_time_elapsed)
-        print(f"Completed in {hours}h {minutes}m {seconds}s")
-
-
-class CodeDataset(Dataset):
-    def __init__(self, args, tokenizer, mode):
-        self.args = args
-        with open(f'data_{mode}.pkl', 'rb') as f:
-            loaded_data = pickle.load(f)
-        self.dataset = loaded_data
-        self.args.logger.info('***** saved dataset *****')
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, item):
-        return tuple(torch.tensor(t) for t in self.dataset[item])
-
 
 class LossDict:
     def __init__(self, keys):
-        self.loss_data = {key: [] for key in keys}
+        self.d = OrderedDict()
+        self.keys = keys
+        for key in keys:
+            self.d[key] = list()
 
     def step(self, other):
-        for key, values in other.loss_data.items():
-            self.loss_data[key].extend(values)
+        for k in other.d:
+            self.d[k] += other.d[k]
 
     def pretty_print(self, args):
-        return ", ".join(f"{key}: {round(sum(values) / len(values) / args.grad_acc_steps, 6)}" 
-                         for key, values in self.loss_data.items() if values)
+        p = []
+        for k, l in self.d.items():
+            if len(l) > 0:
+                s = sum(l) / len(l) / args.grad_acc_steps
+                p.append(f'{k}: {round(s, 6)}')
+        return ', '.join(p)
 
     def clear(self):
-        for key in self.loss_data:
-            self.loss_data[key].clear()
+        for key in self.keys:
+            self.d[key].clear()
 
-    def __getitem__(self, key):
-        return self.loss_data[key]
-
+    def __getitem__(self, k):
+        return self.d[k]
 
 def token_weighted_loss(loss_type, inputs, targets, weights):
-    inputs = inputs.view(-1, inputs.size(-1))
-    targets = targets.view(-1)
-    weights = weights.view(-1)
-
     if loss_type == 'ce':
+        inputs = inputs.view(-1, inputs.size(-1))
+        targets = targets.view(-1)
+        weights = weights.view(-1)
         loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
         loss = loss_fct(inputs, targets)
-        
     elif loss_type == 'nll':
+        inputs = inputs.view(-1, inputs.size(-1))
+        targets = targets.view(-1)
+        weights = weights.view(-1)
         loss_fct = torch.nn.NLLLoss(reduction='none')
         loss = loss_fct(inputs, targets)
-        
     elif loss_type == 'ul':
-        # Ensure `probs` has the correct dimensionality
         probs = F.softmax(inputs, dim=-1)
-        if probs.dim() == 2:
-            probs = probs.unsqueeze(1)  # Add a singleton dimension if probs is 2D
-        gathered_probs = torch.gather(probs, 2, targets.view(-1, 1, 1)).squeeze(-1)
-        loss = -torch.log(torch.clamp(1.0 - gathered_probs, min=1e-5))
-        
+        probs = torch.gather(probs, 2, targets.unsqueeze(-1)).squeeze(-1)
+        probs = torch.clamp((1.0-probs), min=1e-5)
+        loss = -torch.log(probs)
     elif loss_type == 'kl':
-        targets = targets.view(-1, targets.size(-1))  # Match dimensions for KL divergence
+        inputs = inputs.view(-1, inputs.size(-1))
+        targets = targets.view(-1, targets.size(-1))
+        weights = weights.view(-1)
         loss_fct = torch.nn.KLDivLoss(log_target=True, reduction='none')
-        loss = loss_fct(inputs, targets).sum(dim=1)
-        
+        loss = loss_fct(inputs, targets)
+        loss = loss.sum(dim=1)
     else:
-        raise ValueError(f"Unsupported loss type: {loss_type}")
+        assert False
 
     loss = loss[weights != 0]
     return loss.mean()
 
+def get_logits_from_lm(lm, inputs, control_ids):
+    if control_ids is not None:
+        past = lm.get_past_from_prefix(control_ids)
+    else:
+        past = None
+    outputs = lm(inputs, past_key_values=past)
+    shift_logits = outputs.logits[..., :-1, :]
+    shift_labels = inputs[..., 1:].unsqueeze(-1)
+    shift_probs = F.softmax(shift_logits, dim=-1)
+    return shift_logits.squeeze(0), torch.gather(shift_probs, 2, shift_labels).squeeze(-1).squeeze(0)
 
 class Trainer:
     def __init__(self, args):
@@ -132,146 +87,110 @@ class Trainer:
         self.model = None
         self.tokenizer = None
         self.dataset = None
-        self.loss_keys = ['func', 'pos', 'neg']
-        if self.args.kl_loss_weight > 0:
-            self.loss_keys.append('kl')
+        if self.args.sven:
+            self.loss_keys = ['lm', 'contra', 'kl']
+        else:
+            self.loss_keys = ['func', 'pos', 'neg']
+            if self.args.kl_loss_weight > 0:
+                self.loss_keys.append('kl')
 
     def step(self, batch):
         loss_dict = LossDict(self.loss_keys)
-        sample_types, inputs, weights = batch
 
+        sample_types, inputs, weights = batch
         inputs = inputs.to(self.model.device)
         shift_inputs = inputs[..., 1:]
         weights = weights.to(self.model.device)
         shift_weights = weights[..., 1:]
-        
         outputs = self.model(inputs)
-        #outputs.logits = outputs.logits[:, 10:, :]
         shift_logits = outputs.logits[..., :-1, :]
 
-        total_loss = 0.0
+        loss_total = 0.0
         for sample_type in sample_types:
-            total_loss += self._compute_sample_loss(sample_type, shift_logits, shift_inputs, shift_weights, loss_dict)
-            
-            if sample_type in {GOOD, BAD} and self.args.kl_loss_weight > 0:
-                total_loss += self._compute_kl_loss(shift_logits, inputs, shift_weights, loss_dict)
-                
-        return total_loss, loss_dict
+            if sample_type == FUNC:
+                loss = token_weighted_loss('ce', shift_logits, shift_inputs, shift_weights)
+                loss_dict['func'].append(loss.item())
+                loss_total += loss
+            elif sample_type == GOOD:
+                loss = self.args.loss_weight * token_weighted_loss('ce', shift_logits, shift_inputs, shift_weights)
+                loss_dict['pos'].append(loss.item())
+                loss_total += loss
+            elif sample_type == BAD:
+                loss = self.args.loss_weight * token_weighted_loss('ul', shift_logits, shift_inputs, shift_weights)
+                loss_dict['neg'].append(loss.item())
+                loss_total += loss
+            else:
+                assert False
 
-    def _compute_sample_loss(self, sample_type, logits, inputs, weights, loss_dict):
-        if sample_type == FUNC:
-            loss = token_weighted_loss("ce", logits, inputs, weights)
-            loss_dict["func"].append(loss.item())
-        elif sample_type == GOOD:
-            loss = self.args.loss_weight * token_weighted_loss("ce", logits, inputs, weights)
-            loss_dict["pos"].append(loss.item())
-        elif sample_type == BAD:
-            loss = self.args.loss_weight * token_weighted_loss("ul", logits, inputs, weights)
-            loss_dict["neg"].append(loss.item())
-        else:
-            raise ValueError("Unknown sample type.")
-        
-        return loss
+            if (sample_type == GOOD or sample_type == BAD) and self.args.kl_loss_weight > 0:
+                with torch.no_grad():
+                    ref_outputs = self.ref_model(inputs)
+                shift_ref_log_probs = F.log_softmax(ref_outputs.logits[..., :-1, :], dim=-1)
+                shift_log_probs = F.log_softmax(shift_logits, dim=-1)
+                loss = self.args.kl_loss_weight * token_weighted_loss('kl', shift_log_probs, shift_ref_log_probs, 1-shift_weights) / 1000
+                loss_dict['kl'].append(loss.item())
+                loss_total += loss
 
-    def _compute_kl_loss(self, logits, inputs, weights, loss_dict):
+        return loss_total, loss_dict
+
+    def sven_step(self, batch):
+        loss_dict = LossDict(self.loss_keys)
+
+        control_ids, inputs, weights = batch
+        inputs = inputs.to(self.model.device)
+        shift_inputs = inputs[..., 1:].squeeze(0)
+        weights = weights.to(self.model.device)
+        shift_weights = weights[..., 1:].squeeze(0)
+        control_ids = control_ids.to(self.model.device)
+        control_ids -= 1
+
+        correct_logits, correct_label_probs = get_logits_from_lm(self.model, inputs, control_ids)
+        lm_loss = token_weighted_loss('ce', correct_logits, shift_inputs, shift_weights)
+        loss_dict['lm'].append(lm_loss.item())
+
+        incorrect_control_ids = -1 * (control_ids - 1)
+        incorrect_logits, incorrect_label_probs = get_logits_from_lm(self.model, inputs, incorrect_control_ids)
+
+        contrastive_probs = torch.stack((correct_label_probs, incorrect_label_probs), dim=1)
+        contrastive_probs = F.normalize(contrastive_probs, p=1, dim=-1)
+        contrastive_log_probs = torch.log(contrastive_probs)
+        contrastive_labels = torch.zeros(shift_inputs.shape, dtype=torch.int64).to(self.model.device)
+        contrastive_loss = token_weighted_loss('nll', contrastive_log_probs, contrastive_labels, shift_weights)
+        contrastive_loss *= 4
+        loss_dict['contra'].append(contrastive_loss.item())
+
+        assert self.args.kl_loss_weight > 0
+        correct_log_probs = F.log_softmax(correct_logits, dim=-1)
+        self.model.eval()
         with torch.no_grad():
-            ref_outputs = self.ref_model(inputs)
-        
-        shift_ref_log_probs = F.log_softmax(ref_outputs.logits[..., :-1, :], dim=-1)
-        shift_log_probs = F.log_softmax(logits, dim=-1)
-        
-        kl_loss = self.args.kl_loss_weight * token_weighted_loss("kl", shift_log_probs, shift_ref_log_probs, 1 - weights) / 1000
-        loss_dict["kl"].append(kl_loss.item())
-        
-        return kl_loss
+            ref_logits, _ = get_logits_from_lm(self.model, inputs, None)
+        self.model.train()
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+        kl_loss = token_weighted_loss('kl', correct_log_probs, ref_log_probs, 1-shift_weights)
+        incorrect_log_probs = F.log_softmax(incorrect_logits, dim=-1)
+        kl_loss += token_weighted_loss('kl', incorrect_log_probs, ref_log_probs, 1-shift_weights)
+        kl_loss = kl_loss * self.args.kl_loss_weight / 1000
+        loss_dict['kl'].append(kl_loss.item())
+
+        loss_total = lm_loss + contrastive_loss + kl_loss
+
+        return loss_total, loss_dict
 
     def do_eval(self):
         val_sampler = SequentialSampler(self.val_dataset)
         val_dataloader = DataLoader(self.val_dataset, sampler=val_sampler, batch_size=1)
         acc_loss_dict = LossDict(self.loss_keys)
         for batch in val_dataloader:
-            # loss, loss_dict = self.sven_step(batch) if self.args.sven else 
-            loss, loss_dict = self.step(batch)
+            loss, loss_dict = self.sven_step(batch) if self.args.sven else self.step(batch)
             acc_loss_dict.step(loss_dict)
         return acc_loss_dict.pretty_print(self.args)
 
-    def set_seed_util(self, seed):
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
-    def load_model_util(self, model_name, args):
-
-        if model_name in PRETRAINED_MODELS:
-            model_dir = PRETRAINED_MODELS[model_name]
-        elif model_name in CHAT_MODELS:
-            model_dir = CHAT_MODELS[model_name]
-        else:
-            if 'checkpoint-epoch' in model_name:
-                model_dir = os.path.join(args.model_dir, model_name)
-            else:
-                model_dir = os.path.join(args.model_dir, model_name, 'checkpoint-last')
-            assert os.path.exists(model_dir)
-
-        tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        if model_name in PRETRAINED_MODELS or model_name == 'deepseek':
-            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True)
-        else:    
-            model = AutoModelForCausalLM.from_pretrained(model_dir, device_map='auto', trust_remote_code=True, **{'vocab_size': len(tokenizer)})
-        model.resize_token_embeddings(len(tokenizer))
-        return tokenizer, model
-    
-    def load_model2(self, model_path):
-        
-        self.tokenizer, self.model = self.load_model_path(model_path, self.args)
-        self.model.train()
-
-        print(self.model)
-
-        # Define Prefix Tuning configuration
-        prefix_config = PrefixTuningConfig(
-            task_type=TaskType.CAUSAL_LM,
-            num_virtual_tokens=10
-        )
-
-        # prompt_config = PromptTuningConfig(
-        #     task_type="CAUSAL_LM",
-        #     num_virtual_tokens=10
-        # )
-
-        # Apply PEFT's prefix tuning to the model
-        self.model = get_peft_model(self.model, prefix_config)
-
-        # Freeze the base model's parameters
-        # for param in self.model.base_model.parameters():
-        #     param.requires_grad = False
-
-    
-
     def load_model(self):
-        self.tokenizer, self.model = self.load_model_util(self.args.pretrain_name, self.args)
+        self.tokenizer, self.model = load_model(self.args.pretrain_name, self.args)
         self.model.train()
-        print(self.model)
-        # Define Prefix Tuning configuration
-        prefix_config = PrefixTuningConfig(
-            task_type="CAUSAL_LM",  # Specify the task type
-            num_virtual_tokens=30,  # Number of prefix tokens
-            num_prefix_tokens=30,
-            num_hidden_layers=self.model.config.num_layers,  # Number of layers in the base model
-            num_attention_heads=self.model.config.num_attention_heads,
-            prefix_projection=True,
-            prefix_dropout=0.1,
-        )
 
-        # Apply PEFT's prefix tuning to the model
-        self.model = get_peft_model(self.model, prefix_config)
-
-        # Freeze the base model's parameters
-        for param in self.model.base_model.parameters():
-            param.requires_grad = False
-        print(self.model)
         if self.args.kl_loss_weight > 0 and not self.args.sven:
-            _, self.ref_model = self.load_model_util(self.args.pretrain_name, self.args)
+            _, self.ref_model = load_model(self.args.pretrain_name, self.args)
             self.ref_model.eval()
 
     def load_dataset(self):
@@ -279,155 +198,133 @@ class Trainer:
         self.val_dataset = CodeDataset(self.args, self.tokenizer, 'val')
 
     def save(self, path):
+        """
+        For normal models this saves the whole set of weights, for LoRA models it saves the adapter.
+        """
+        if self.args.sven:
+            os.makedirs(path, exist_ok=True)
+            prefix_file = os.path.join(path, 'pytorch_model.bin')
+            state_dict = self.model.prefix_params.state_dict()
+            for k, v in state_dict.items():
+                state_dict[k] = v.cpu()
+            torch.save(state_dict, prefix_file)
+        else:
+            self.model.save_pretrained(path)
+            self.tokenizer.save_pretrained(path)
 
-        self.model.save_pretrained(path)
-        self.tokenizer.save_pretrained(path)
-    
-
-    def _configure_optimizer(self):
-        # Only train the prefix tuning parameters
-        # optimizer_grouped_parameters = [
-        #     {
-        #         "params": [p for p in self.model.parameters() if p.requires_grad],
-        #         "weight_decay": self.args.weight_decay
-        #     }
-        # ]
-        for n, p in self.model.named_parameters():
-            if p.requires_grad:
-                print(n)
-        return AdamW([p for p in self.model.parameters() if p.requires_grad], lr=self.args.learning_rate, eps=self.args.adam_epsilon)
-
-    def _log_training_details(self, num_samples, batch_size, total_steps, num_val_samples):
-        self.args.logger.info("***** Running training *****")
-        self.args.logger.info(f"  Num samples = {num_samples}")
-        self.args.logger.info(f"  Num epochs = {self.args.num_train_epochs}")
-        self.args.logger.info(f"  Batch size (no accumulation) = {self.args.batch_size}")
-        self.args.logger.info(f"  Total batch size (with accumulation) = {batch_size}")
-        self.args.logger.info(f"  Gradient accumulation steps = {self.args.grad_acc_steps}")
-        self.args.logger.info(f"  Total optimization steps = {total_steps}")
-        self.args.logger.info(f"  Num validation samples = {num_val_samples}")
-
-    def _save_checkpoint(self, epoch):
-        self.model.eval()
-        with torch.no_grad():
-            eval_loss_pp = self.do_eval()
-        self.args.logger.info(f"Validation loss for epoch {epoch}: {eval_loss_pp}")
-        output_dir = os.path.join(self.args.output_dir, f"checkpoint-epoch-{epoch}")
-        last_output_dir = os.path.join(self.args.output_dir, "checkpoint-last")
-        self.args.logger.info(f"Saving model checkpoint to {output_dir} and {last_output_dir}")
-        self.save(output_dir)
-        self.save(last_output_dir)
-
-    def load_model_path(self, model_path, args):
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-        # Load model
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, 
-            device_map='auto', 
-            trust_remote_code=True
+    def create_lora_config(self):
+        """
+        Includes all linear layers in the LoRA training.
+        """
+        self.lora_config = LoraConfig(
+            r=self.args.r,
+            target_modules=list(set([name for name in re.findall(r'\((\w+)\): Linear', str(self.model.modules))])),
+            lora_alpha=self.args.lora_alpha,
+            lora_dropout=self.args.lora_dropout,
+            task_type="CAUSAL_LM"
         )
 
-        model.resize_token_embeddings(len(tokenizer))
-
-        # if self.args.num_prefix_tokens > 0:
-        #     print('NUM PREFIX TOKENS:', self.args.num_prefix_tokens)
-        #     print('MODEL CONFIG HIDDEN SIZE:', model.config.hidden_size)
-        #     prefix_config = PrefixTuningConfig(
-        #         task_type=TaskType.CAUSAL_LM,
-        #         num_virtual_tokens=self.args.num_prefix_tokens,
-        #         token_dim=model.config.hidden_size
-        #     )
-        #     model = get_peft_model(model, prefix_config)
-
-        return tokenizer, model
-
-
-    def _save_final_checkpoint(self):
-        self.model.eval()
-        with torch.no_grad():
-            eval_loss_pp = self.do_eval()
-        last_output_dir = os.path.join(self.args.output_dir, "checkpoint-last")
-        self.args.logger.info(f"Final validation loss: {eval_loss_pp}")
-        self.args.logger.info(f"Saving final model checkpoint to {last_output_dir}")
-        self.save(last_output_dir)
-
-    def print_graph(self, node, indent=0):
-        if node is None:
-            return
-        print(" " * indent, type(node).__name__)
-        if hasattr(node, 'next_functions'):
-            for sub_node in node.next_functions:
-                if sub_node[0] is not None:
-                    self.print_graph(sub_node[0], indent + 4)
-
+    def create_prefix_config(self):
+        self.prefix_tuning_config = PrefixTuningConfig(
+            task_type="CAUSAL_LM",
+            num_virtual_tokens=self.args.num_prefix_tokens
+        )
 
     def run(self):
-        self.load_model2(model_path='/app/UserData/Sam/nlp/CS769_SafeCoder/pretrained_models/starcoderbase-1b')
+        self.load_model()
         self.load_dataset()
+        self.args.logger.info('test')
+
+
+        if self.args.lora:
+            self.create_lora_config()
+            self.model = get_peft_model(self.model, self.lora_config)
+        if self.args.prefix_tuning:
+            self.args.logger.info('prefix tuning!')
+            self.create_prefix_config()
+            self.model = get_peft_model(self.model, self.prefix_tuning_config)
+
 
         self.args.logger.info(f'Training args {self.args}')
 
-        # Configuration for batch and steps
-        batch_size = self.args.batch_size * self.args.grad_acc_steps
-        total_steps = (len(self.dataset) // batch_size) * self.args.num_train_epochs
+        batch_size = self.args.batch_size
+        train_sampler = RandomSampler(self.dataset)
+        train_dataloader = DataLoader(self.dataset, sampler=train_sampler, batch_size=batch_size, drop_last=True)
 
-        train_dataloader = DataLoader(
-            self.dataset, 
-            sampler=RandomSampler(self.dataset), 
-            batch_size=self.args.batch_size, 
-            drop_last=True
-        )
+        total_samples = len(self.dataset)
+        batch_size = batch_size * self.args.grad_acc_steps
+        total_steps = total_samples // batch_size * self.args.num_train_epochs
 
-        # Optimizer and Scheduler
-        optimizer = self._configure_optimizer()
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=self.args.warmup_steps, 
-            num_training_steps=total_steps
-        )
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in self.model.named_parameters() if (not any(nd in n for nd in no_decay)) and p.requires_grad],
+            'weight_decay': self.args.weight_decay},
+            {'params': [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad],
+            'weight_decay': 0.0}
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=total_steps)
+        num_params = sum(p.numel() for p in self.model.parameters())
+        num_trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-        # Logging details
-        self._log_training_details(len(self.dataset), batch_size, total_steps, len(self.val_dataset))
+        self.args.logger.info('***** Running training *****')
+        self.args.logger.info('  Num samples = %d', total_samples)
+        self.args.logger.info('  Num epoch = %d', self.args.num_train_epochs)
+        self.args.logger.info('  Batch size= 1')
+        self.args.logger.info('  Total batch size (w. accumulation) = %d', batch_size)
+        self.args.logger.info('  Gradient Accumulation steps = %d', self.args.grad_acc_steps)
+        self.args.logger.info('  Total optimization steps = %d', total_steps)
+        self.args.logger.info('  Num val samples = %d', len(self.val_dataset))
+        self.args.logger.info('  Num parameters = %d', num_params)
+        self.args.logger.info('  Num trainable parameters = %d', num_trainable_params)
 
         global_step, acc_loss_dict = 0, LossDict(self.loss_keys)
-        self.set_seed_util(self.args.seed)
+        set_seed(self.args.seed)
         timer = Timer(total_steps)
         timer.start()
-
-        for epoch in range(self.args.num_train_epochs):
-            self.model.train()
+        self.model.train()
+        for idx in range(self.args.num_train_epochs):
             for step, batch in enumerate(train_dataloader):
-                loss, loss_dict = self.step(batch)
-
+                loss, loss_dict = self.sven_step(batch) if self.args.sven else self.step(batch)
                 loss /= self.args.grad_acc_steps
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 acc_loss_dict.step(loss_dict)
 
-                if (step + 1) % self.args.grad_acc_steps == 0:
+                if (step+1) % self.args.grad_acc_steps == 0:
                     optimizer.step()
-                    for n, p in self.model.named_parameters():
-                        if p.requires_grad:
-                            print(p.grad)
                     optimizer.zero_grad()
                     scheduler.step()  
                     global_step += 1
 
-                    if global_step % self.args.logging_steps == 0:
+                    if self.args.logging_steps > 0 and global_step % self.args.logging_steps == 0:
                         acc_loss_pp = acc_loss_dict.pretty_print(self.args)
-                        self.args.logger.info(
-                            f"Epoch: {epoch + 1}/{self.args.num_train_epochs}, "
-                            f"Step: {global_step}/{total_steps}, Loss: {acc_loss_pp}, Timer: {timer}"
-                        )
+                        self.args.logger.info('epochs: %s/%d, steps: %s/%d, %s, %s', idx+1, self.args.num_train_epochs, global_step, total_steps, acc_loss_pp, timer)
                         acc_loss_dict.clear()
 
                     timer.end()
                     timer.start()
 
-            if (epoch + 1) % self.args.save_epochs == 0:
-                self._save_checkpoint(epoch + 1)
+            if self.args.save_epochs > 0 and (idx+1) % self.args.save_epochs == 0:
+                self.model.eval()
+                with torch.no_grad():
+                    eval_loss_pp = self.do_eval()
+                self.model.train()
+                self.args.logger.info('val epoch %s: %s', idx+1, eval_loss_pp)
+                output_dir = os.path.join(self.args.output_dir, f'checkpoint-epoch-{idx+1}')
+                last_output_dir = os.path.join(self.args.output_dir, f'checkpoint-last')
+                self.args.logger.info('Saving model checkpoint to %s and %s', output_dir, last_output_dir)
+                self.save(output_dir)
+                self.save(last_output_dir)
 
-        # Final checkpoint if not saved at last epoch
-        if (epoch + 1) % self.args.save_epochs != 0:
-            self._save_final_checkpoint()
+        if (idx+1) % self.args.save_epochs != 0:
+            self.model.eval()
+            with torch.no_grad():
+                eval_loss_pp = self.do_eval()
+            self.args.logger.info('final eval loss: %s', eval_loss_pp)
+            # output_dir = os.path.join(self.args.output_dir, f'checkpoint-epoch-{idx+1}')
+            last_output_dir = os.path.join(self.args.output_dir, f'checkpoint-last')
+            # self.args.logger.info('Saving model checkpoint to %s and %s', output_dir, last_output_dir)
+            self.args.logger.info('Saving model checkpoint to %s', last_output_dir)
+            # self.save(output_dir)
+            self.save(last_output_dir)
