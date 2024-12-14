@@ -26,6 +26,6 @@ python train_lora.py --pretrain_name starcoderbase-1b --lora --r 16 --output_nam
 ```
 ### Prefix Tuning
 ```console
-python train_lora.py --pretrain_name starcoderbase-1b --prefix_tuning --num_prefix_tokens 16 --output_name starcoderbase-1b-safecoder-prefix-16 --datasets evol sec-desc sec-new-desc
+python train_prefix_tuning.py --pretrain_name starcoderbase-1b --prefix_tuning --num_prefix_tokens 16 --output_name starcoderbase-1b-safecoder-prefix-16 --datasets evol sec-desc sec-new-desc
 ```
 ### DPO
